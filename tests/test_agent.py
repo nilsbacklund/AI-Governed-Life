@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -143,6 +144,68 @@ class TestTurnExecution:
         # After 3 nudges, timer should have been force-set
         assert timer.is_active()
         assert "auto-scheduled" in timer.reason
+
+    @patch("agent.build_system_prompt", return_value="system prompt")
+    async def test_reflection_trigger_skips_nudge(self, _prompt, agent_setup, tz):
+        """REFLECTION triggers should NOT nudge about missing timers."""
+        agent, config, timer, queue = agent_setup
+        # No timer set — but REFLECTION should skip nudging
+
+        mock_client = AsyncMock()
+        mock_client.models.generate_content.return_value = _make_response(
+            _text_part("Nothing to do right now.")
+        )
+        agent._client = mock_client
+
+        trigger = {
+            "kind": "REFLECTION",
+            "detail": "self-improvement check",
+            "content": [{"type": "text", "text": "[SELF-REFLECTION] What can you do to improve?"}],
+        }
+        await agent._run_turn(trigger)
+
+        # Only 1 API call — no nudges
+        assert mock_client.models.generate_content.await_count == 1
+        # Timer should NOT have been force-set
+        assert not timer.is_active()
+
+
+class TestReflectionInterval:
+
+    def test_interval_recent_activity(self, agent_setup):
+        agent, _, _, _ = agent_setup
+        # Last activity just happened
+        agent._last_activity_time = time.monotonic()
+        interval = agent._compute_reflection_interval()
+        assert interval == 10 * 60  # 10 minutes
+
+    def test_interval_moderate_activity(self, agent_setup):
+        agent, _, _, _ = agent_setup
+        # Last activity 45 minutes ago
+        agent._last_activity_time = time.monotonic() - 45 * 60
+        interval = agent._compute_reflection_interval()
+        assert interval == 30 * 60  # 30 minutes
+
+    def test_interval_idle(self, agent_setup):
+        agent, _, _, _ = agent_setup
+        # Last activity 3 hours ago
+        agent._last_activity_time = time.monotonic() - 3 * 60 * 60
+        interval = agent._compute_reflection_interval()
+        assert interval == 60 * 60  # 60 minutes
+
+    def test_interval_boundary_30min(self, agent_setup):
+        agent, _, _, _ = agent_setup
+        # Exactly 30 minutes — should be 30min interval
+        agent._last_activity_time = time.monotonic() - 30 * 60
+        interval = agent._compute_reflection_interval()
+        assert interval == 30 * 60
+
+    def test_interval_boundary_2h(self, agent_setup):
+        agent, _, _, _ = agent_setup
+        # Exactly 2 hours — should be 60min interval
+        agent._last_activity_time = time.monotonic() - 2 * 60 * 60
+        interval = agent._compute_reflection_interval()
+        assert interval == 60 * 60
 
 
 class TestSerialization:

@@ -1,12 +1,13 @@
-import json
-import os
+import ast
+import asyncio
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from google.genai import types
 
-from weather import fetch_weather
 from search import web_search
 
 # --- Tool declarations (Google GenAI format) ---
@@ -103,24 +104,6 @@ TOOL_DECLARATIONS = [
         },
     ),
     types.FunctionDeclaration(
-        name="get_weather",
-        description="Get current weather and forecast. Use for clothing advice (jacket? umbrella?), commute planning (rain during bike ride?), and activity suggestions. Do NOT call more than once per hour unless location changed.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "location": {
-                    "type": "string",
-                    "description": "City name ('Eindhoven') or coordinates ('51.44,5.47'). Defaults to home location."
-                },
-                "forecast_hours": {
-                    "type": "integer",
-                    "description": "Hours ahead to forecast. Default: 12. Use 3 if you only need the next few hours."
-                }
-            },
-            "required": []
-        },
-    ),
-    types.FunctionDeclaration(
         name="web_search",
         description="Search the web for information not in your files. Use for recipes, store hours, prices, transit, events. Do NOT use for info already in profile files — read those instead. Be specific in queries for better results.",
         parameters_json_schema={
@@ -134,21 +117,114 @@ TOOL_DECLARATIONS = [
             "required": ["query"]
         },
     ),
+    types.FunctionDeclaration(
+        name="call_integration",
+        description="Call a plugin action. Use this for all integrations (weather, and any plugins you've created). Check the 'Available Integrations' section in your system prompt to see loaded plugins and their actions.",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Plugin name (e.g. 'weather', 'echo')."
+                },
+                "action": {
+                    "type": "string",
+                    "description": "Action to call on the plugin (e.g. 'get_forecast')."
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Parameters to pass to the action. Each plugin documents its expected params."
+                }
+            },
+            "required": ["name", "action"]
+        },
+    ),
+    types.FunctionDeclaration(
+        name="write_plugin",
+        description="Create or update a plugin at runtime. Write Python code that will be saved to plugins/<name>.py and hot-loaded. The plugin must expose: PLUGIN_NAME (str), ACTIONS (dict), and an async call(action, params) function. Optionally expose PLUGIN_DESCRIPTION (str) and async setup(config). After writing, all declared actions are auto-tested with empty params — the results tell you which work and which need fixing. You can call this again to overwrite and fix a broken plugin. Dangerous imports (subprocess, shutil, sys, ctypes, os) are blocked.",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Plugin name (will be saved as plugins/<name>.py). Use snake_case."
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Complete Python source code for the plugin."
+                }
+            },
+            "required": ["name", "code"]
+        },
+    ),
+    types.FunctionDeclaration(
+        name="install_package",
+        description="Install Python packages from PyPI. Use this when a plugin needs a library that isn't installed yet. Only accepts package names (not URLs or local paths). Supports version specifiers like 'openpyxl>=3.0'. Multiple packages can be space-separated.",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {
+                "packages": {
+                    "type": "string",
+                    "description": "Space-separated package names to install. E.g. 'openpyxl' or 'fitparse garmin-fit-sdk' or 'google-api-python-client>=2.0'."
+                }
+            },
+            "required": ["packages"]
+        },
+    ),
 ]
 
 
-# --- Dependency injection for telegram send ---
+# --- Dependency injection ---
 
 _send_fn = None
 _config = None
 _timer = None
+_plugin_registry = None
 
 
-def init_tools(send_fn, config, timer):
-    global _send_fn, _config, _timer
+def init_tools(send_fn, config, timer, plugin_registry=None):
+    global _send_fn, _config, _timer, _plugin_registry
     _send_fn = send_fn
     _config = config
     _timer = timer
+    _plugin_registry = plugin_registry
+
+
+# --- Blocked imports for write_plugin safety ---
+
+_BLOCKED_IMPORTS = frozenset({
+    "subprocess", "shutil", "sys", "ctypes", "os",
+    "importlib", "code", "codeop", "compileall",
+    "multiprocessing", "signal", "socket",
+})
+
+
+def _fresh_import(path: Path, name: str):
+    """Import a module from file, bypassing all caches."""
+    from types import ModuleType
+    source = path.read_text()
+    module = ModuleType(f"plugins.{name}")
+    module.__file__ = str(path)
+    exec(compile(source, str(path), "exec"), module.__dict__)
+    return module
+
+
+def _check_imports(code: str) -> list[str]:
+    """Parse code with ast and return list of blocked imports found."""
+    tree = ast.parse(code)
+    blocked = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in _BLOCKED_IMPORTS:
+                    blocked.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top = node.module.split(".")[0]
+                if top in _BLOCKED_IMPORTS:
+                    blocked.append(node.module)
+    return blocked
 
 
 def _sanitize_path(path_str: str) -> Path:
@@ -178,7 +254,16 @@ async def execute_tool(name: str, args: dict) -> dict:
                 full = _config.data_dir / path
                 if not full.exists():
                     return {"error": f"File not found: {args['path']}. Check the Available files listing for valid paths.", "is_error": True}
-                return {"content": full.read_text()}
+                try:
+                    return {"content": full.read_text(encoding="utf-8")}
+                except (UnicodeDecodeError, ValueError):
+                    size = full.stat().st_size
+                    return {
+                        "binary": True,
+                        "path": args["path"],
+                        "size_bytes": size,
+                        "note": "Binary file — use a plugin to parse this format. Install needed packages with install_package first.",
+                    }
 
             case "write_file":
                 path = _sanitize_path(args["path"])
@@ -206,23 +291,161 @@ async def execute_tool(name: str, args: dict) -> dict:
                 _timer.schedule(wakeup_time, reason)
                 return {"status": "scheduled", "wakeup_at": wakeup_time.isoformat(), "reason": reason}
 
-            case "get_weather":
-                location = args.get("location", _config.default_location)
-                hours = args.get("forecast_hours", 12)
-                # Parse coordinates if given as "lat,lon"
-                if "," in str(location):
-                    parts = location.split(",")
-                    lat, lon = float(parts[0].strip()), float(parts[1].strip())
-                else:
-                    lat, lon = _config.default_lat, _config.default_lon
-                return await fetch_weather(lat, lon, hours)
-
             case "web_search":
                 results = await web_search(args["query"], _config.tavily_api_key)
                 return {"results": results[:5]}
+
+            case "call_integration":
+                plugin_name = args["name"]
+                action = args["action"]
+                params = args.get("params", {})
+                if _plugin_registry is None:
+                    return {"error": "Plugin registry not initialized.", "is_error": True}
+                try:
+                    result = await _plugin_registry.call(plugin_name, action, params)
+                    # Ensure result is always a dict (plugins may return strings, lists, etc.)
+                    if not isinstance(result, dict):
+                        result = {"result": result}
+                    if "error" in result:
+                        result["is_error"] = True
+                    return result
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}", "plugin": plugin_name, "action": action, "is_error": True}
+
+            case "write_plugin":
+                return await _execute_write_plugin(args["name"], args["code"])
+
+            case "install_package":
+                return await _execute_install_package(args["packages"])
 
             case _:
                 return {"error": f"Unknown tool: {name}", "is_error": True}
 
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "is_error": True}
+
+
+async def _execute_write_plugin(name: str, code: str) -> dict:
+    """Write, validate, auto-test, and hot-load a plugin."""
+    from plugins import PLUGINS_DIR
+
+    # 1. Safety check: parse and block dangerous imports
+    try:
+        blocked = _check_imports(code)
+    except SyntaxError as e:
+        # Write the file anyway so the agent can read and fix it
+        plugin_path = PLUGINS_DIR / f"{name}.py"
+        plugin_path.write_text(code)
+        return {
+            "status": "syntax_error",
+            "error": f"SyntaxError: {e}",
+            "path": str(plugin_path),
+            "loaded": False,
+            "is_error": True,
+        }
+
+    if blocked:
+        return {
+            "status": "blocked_imports",
+            "error": f"Blocked imports found: {blocked}. These are not allowed for security reasons.",
+            "loaded": False,
+            "is_error": True,
+        }
+
+    # 2. Write the code to plugins/<name>.py
+    plugin_path = PLUGINS_DIR / f"{name}.py"
+    plugin_path.write_text(code)
+
+    # 3. Validate: import and check interface
+    try:
+        module = _fresh_import(plugin_path, name)
+    except Exception as e:
+        return {
+            "status": "import_error",
+            "error": f"{type(e).__name__}: {e}",
+            "path": str(plugin_path),
+            "loaded": False,
+            "is_error": True,
+        }
+
+    for attr in ("PLUGIN_NAME", "ACTIONS", "call"):
+        if not hasattr(module, attr):
+            return {
+                "status": "validation_error",
+                "error": f"Plugin missing required attribute: {attr}",
+                "path": str(plugin_path),
+                "loaded": False,
+                "is_error": True,
+            }
+
+    # 4. Auto-test: call every declared action with empty params
+    actions_tested = {}
+    for action_name in module.ACTIONS:
+        try:
+            await module.call(action_name, {})
+            actions_tested[action_name] = "ok"
+        except Exception as e:
+            actions_tested[action_name] = f"{type(e).__name__}: {e}"
+
+    # 5. Run setup if available
+    if hasattr(module, "setup") and _config:
+        try:
+            await module.setup(_config)
+        except Exception as e:
+            actions_tested["_setup"] = f"{type(e).__name__}: {e}"
+
+    # 6. Hot-load into registry
+    if _plugin_registry is not None:
+        _plugin_registry.unregister(name)
+        _plugin_registry.register(module.PLUGIN_NAME, module)
+
+    return {
+        "status": "loaded",
+        "plugin": module.PLUGIN_NAME,
+        "actions_tested": actions_tested,
+        "path": str(plugin_path),
+        "loaded": True,
+    }
+
+
+# --- Package installation ---
+
+_PACKAGE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*([<>=!~]+[a-zA-Z0-9_.*]+)?$")
+
+
+async def _execute_install_package(packages_str: str) -> dict:
+    """Validate and install Python packages from PyPI."""
+    packages = packages_str.split()
+    if not packages:
+        return {"error": "No package names provided.", "is_error": True}
+
+    # Validate each package name
+    invalid = [p for p in packages if not _PACKAGE_RE.match(p)]
+    if invalid:
+        return {
+            "error": f"Invalid package names: {invalid}. Only PyPI package names are allowed (no URLs, paths, or flags).",
+            "is_error": True,
+        }
+
+    # Run pip install
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "pip", "install", "--no-input", *packages,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    output = stdout.decode(errors="replace").strip()
+
+    if proc.returncode != 0:
+        return {
+            "status": "failed",
+            "packages": packages,
+            "output": output[-2000:],  # Truncate long output
+            "is_error": True,
+        }
+
+    return {
+        "status": "installed",
+        "packages": packages,
+        "output": output[-1000:],
+    }

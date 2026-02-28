@@ -21,3 +21,5 @@
 
 - Use Sonnet 4.6
 - File system it can read into to handle context length (if needed)
+
+- The tools it creates might need a bit more guidance. Perhaps init a claude code instance or have a plan, execute and validate process

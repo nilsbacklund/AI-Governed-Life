@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 from config import Config
+from plugins import PluginRegistry
 from timer import WakeupTimer
 from tools import init_tools
 
@@ -35,5 +36,6 @@ def setup_tools(tmp_path, tz):
     )
     (tmp_path / "data").mkdir()
     timer = WakeupTimer(tz)
-    init_tools(send_fn, config, timer)
+    registry = PluginRegistry()
+    init_tools(send_fn, config, timer, registry)
     return send_fn, config, timer

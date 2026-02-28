@@ -24,11 +24,13 @@ class Agent:
         timer: WakeupTimer,
         queue: asyncio.Queue,
         logger: AgentLogger,
+        plugin_registry=None,
     ):
         self._config = config
         self._timer = timer
         self._queue = queue
         self._logger = logger
+        self._plugin_registry = plugin_registry
         self._tz = ZoneInfo(config.timezone)
         self._client = genai.Client(
             vertexai=True,
@@ -36,6 +38,7 @@ class Agent:
             location=config.gcp_region,
         ).aio
         self._conversation: list[dict] = []
+        self._last_activity_time: float = time.monotonic()
 
     def load_history(self):
         if self._config.history_file.exists():
@@ -59,12 +62,27 @@ class Agent:
             trigger = await self._wait_for_trigger()
             await self._run_turn(trigger)
 
+    def _compute_reflection_interval(self) -> float:
+        """Compute reflection poke interval based on time since last user activity."""
+        elapsed = time.monotonic() - self._last_activity_time
+        if elapsed < 30 * 60:       # < 30 min
+            return 10 * 60           # poke every 10 min
+        elif elapsed < 2 * 60 * 60:  # 30min–2h
+            return 30 * 60           # poke every 30 min
+        else:                        # > 2h
+            return 60 * 60           # poke every 60 min
+
     async def _wait_for_trigger(self) -> dict:
         msg_task = asyncio.create_task(self._queue.get(), name="msg")
         timer_task = asyncio.create_task(self._timer.wait(), name="timer")
+        reflection_interval = self._compute_reflection_interval()
+        reflection_task = asyncio.create_task(
+            asyncio.sleep(reflection_interval), name="reflection"
+        )
 
+        tasks = [msg_task, timer_task, reflection_task]
         done, pending = await asyncio.wait(
-            [msg_task, timer_task],
+            tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
 
@@ -75,20 +93,34 @@ class Agent:
             except asyncio.CancelledError:
                 pass
 
-        result = done.pop().result()
-        if isinstance(result, str):
-            # Timer returned a reason string
+        finished = done.pop()
+        if finished is reflection_task:
+            now_str = datetime.now(self._tz).strftime('%H:%M')
+            trigger_text = (
+                f"[SELF-REFLECTION] Wakeup at {now_str}. "
+                "What can you do to improve right now? Consider: writing plugins for "
+                "missing capabilities, updating your files, preparing for upcoming events, "
+                "or checking on pending tasks."
+            )
+            trigger = {
+                "kind": "REFLECTION",
+                "detail": "self-improvement check",
+                "content": [{"type": "text", "text": trigger_text}],
+            }
+        elif finished is timer_task:
+            result = finished.result()
             trigger_text = f"[TIMER] Wakeup at {datetime.now(self._tz).strftime('%H:%M')}. Reason: {result}"
             trigger = {"kind": "TIMER", "detail": result, "content": [{"type": "text", "text": trigger_text}]}
         else:
-            # Message — result is a list of content blocks
+            result = finished.result()
+            self._last_activity_time = time.monotonic()
             trigger = {"kind": "USER", "detail": _extract_text(result), "content": result}
 
         # Drain extra messages from the queue
         while not self._queue.empty():
             extra = self._queue.get_nowait()
             trigger["content"].extend(extra)
-            if trigger["kind"] == "TIMER":
+            if trigger["kind"] in ("TIMER", "REFLECTION"):
                 trigger["detail"] += " + messages"
 
         return trigger
@@ -103,10 +135,11 @@ class Agent:
         call_num = 0
         nudge_count = 0
         max_nudges = 3
+        is_reflection = trigger["kind"] == "REFLECTION"
 
         while True:
             call_num += 1
-            system = build_system_prompt(self._config.data_dir, self._tz)
+            system = build_system_prompt(self._config.data_dir, self._tz, self._plugin_registry)
 
             # Build contents list as GenAI Content objects
             contents = _build_contents(self._conversation)
@@ -156,18 +189,19 @@ class Agent:
             self._logger.log_api_call(call_num, trigger_info, response, tc_log, latency_ms)
 
             if not function_calls:
-                # No tools — check if timer is active
-                if not self._timer.is_active() and nudge_count < max_nudges:
-                    nudge_count += 1
-                    self._conversation.append({
-                        "role": "user",
-                        "content": [{"type": "text", "text": "[SYSTEM] Heads up — there's no wakeup timer set. When should you check in next?"}],
-                    })
-                    continue
-                elif not self._timer.is_active():
-                    # Force-set a default timer
-                    wakeup_time = self._timer.parse_time("+30m")
-                    self._timer.schedule(wakeup_time, "Default check-in (auto-scheduled)")
+                # No tools — check if timer is active (skip nudge for REFLECTION triggers)
+                if not is_reflection:
+                    if not self._timer.is_active() and nudge_count < max_nudges:
+                        nudge_count += 1
+                        self._conversation.append({
+                            "role": "user",
+                            "content": [{"type": "text", "text": "[SYSTEM] Heads up — there's no wakeup timer set. When should you check in next?"}],
+                        })
+                        continue
+                    elif not self._timer.is_active():
+                        # Force-set a default timer
+                        wakeup_time = self._timer.parse_time("+30m")
+                        self._timer.schedule(wakeup_time, "Default check-in (auto-scheduled)")
                 break
 
             # Execute tools and collect results
@@ -177,6 +211,9 @@ class Agent:
                 args = dict(fc.args or {})
                 self._logger.log_tool_call(fc.name, _args_summary(args))
                 result = await execute_tool(fc.name, args)
+                # Guard against non-dict results (e.g. plugins returning strings)
+                if not isinstance(result, dict):
+                    result = {"result": result}
                 is_error = result.pop("is_error", False)
                 tool_results.append({
                     "type": "function_response",
@@ -267,7 +304,8 @@ def _build_contents(conversation: list[dict]) -> list[types.Content]:
                             data=base64.b64decode(source["data"]),
                             mime_type=source.get("media_type", "image/jpeg"),
                         ))
-            contents.append(types.Content(role="user", parts=parts))
+            if parts:
+                contents.append(types.Content(role="user", parts=parts))
 
         elif role == "assistant" or role == "model":
             parts = []
@@ -288,7 +326,8 @@ def _build_contents(conversation: list[dict]) -> list[types.Content]:
                         if block.get("thought_signature"):
                             fc_part.thought_signature = base64.b64decode(block["thought_signature"])
                         parts.append(fc_part)
-            contents.append(types.Content(role="model", parts=parts))
+            if parts:
+                contents.append(types.Content(role="model", parts=parts))
 
         elif role == "tool":
             parts = []
@@ -299,7 +338,8 @@ def _build_contents(conversation: list[dict]) -> list[types.Content]:
                             name=block["name"],
                             response=block.get("response", {}),
                         ))
-            contents.append(types.Content(role="user", parts=parts))
+            if parts:
+                contents.append(types.Content(role="user", parts=parts))
 
     return contents
 

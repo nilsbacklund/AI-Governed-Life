@@ -7,3 +7,4 @@ history.json
 data/
 groseries_at_home.csv
 .pytest_cache/
+plugins/
