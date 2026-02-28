@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+logs/
+history.json
+.claude/
+data/
+groseries_at_home.csv
+.pytest_cache/
