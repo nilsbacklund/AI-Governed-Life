@@ -3,18 +3,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
-# Gemini 3.1 Pro Preview pricing per million tokens
-PRICE_INPUT = 2.00
-PRICE_OUTPUT = 12.00
-
-
-def _cost(usage) -> float:
-    input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
-    return (
-        input_tokens * PRICE_INPUT
-        + output_tokens * PRICE_OUTPUT
-    ) / 1_000_000
+def _cost(response) -> float:
+    """Extract cost from LiteLLM response, falling back to zero."""
+    hidden = getattr(response, "_hidden_params", None)
+    if hidden and isinstance(hidden, dict):
+        return hidden.get("response_cost", 0) or 0
+    return 0
 
 
 class AgentLogger:
@@ -39,10 +33,10 @@ class AgentLogger:
         self._simple.flush()
 
     def log_api_call(self, call_num: int, trigger_info: str, response, tool_calls: list, latency_ms: int):
-        usage = response.usage_metadata
-        cost = _cost(usage)
-        input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        usage = response.usage
+        cost = _cost(response)
+        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(usage, "completion_tokens", 0) or 0
 
         tools_str = ", ".join(
             f'{tc["name"]}({_short_args(tc["args"])})'

@@ -21,8 +21,6 @@ def tz():
 @pytest.fixture
 def agent_setup(tmp_path, tz):
     config = Config(
-        gcp_project_id="GeneralOrder",
-        gcp_region="global",
         telegram_bot_token="test-bot",
         telegram_chat_id=123,
         tavily_api_key="test-tavily",
@@ -30,7 +28,7 @@ def agent_setup(tmp_path, tz):
         default_location="Eindhoven",
         default_lat=51.4416,
         default_lon=5.4697,
-        model="gemini-3.1-pro-preview",
+        model="vertex_ai_beta/gemini-3.1-pro-preview",
         max_tokens=4096,
         token_threshold=80000,
         data_dir=tmp_path / "data",
@@ -46,35 +44,39 @@ def agent_setup(tmp_path, tz):
     return agent, config, timer, queue
 
 
-def _text_part(text):
-    return SimpleNamespace(text=text, function_call=None)
-
-
-def _function_call_part(name, args):
-    return SimpleNamespace(text=None, function_call=SimpleNamespace(name=name, args=args), thought_signature=None)
-
-
-def _make_response(*parts, usage=None):
+def _tool_call(name, args, call_id="call_1"):
     return SimpleNamespace(
-        text=next((p.text for p in parts if p.text), None),
-        candidates=[SimpleNamespace(content=SimpleNamespace(parts=list(parts)))],
-        usage_metadata=usage or SimpleNamespace(prompt_token_count=0, candidates_token_count=0, total_token_count=0),
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name=name, arguments=json.dumps(args)),
+    )
+
+
+def _make_response(content=None, tool_calls=None, usage=None):
+    """Build a mock LiteLLM response in OpenAI format."""
+    message = SimpleNamespace(
+        content=content,
+        tool_calls=tool_calls,
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message)],
+        usage=usage or SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        _hidden_params={"response_cost": 0},
     )
 
 
 class TestTurnExecution:
 
     @patch("agent.build_system_prompt", return_value="system prompt")
-    async def test_turn_no_tools_with_timer(self, _prompt, agent_setup, tz):
+    @patch("agent.litellm")
+    async def test_turn_no_tools_with_timer(self, mock_litellm, _prompt, agent_setup, tz):
         agent, config, timer, queue = agent_setup
         # Pre-set timer so no nudge happens
         timer.schedule(datetime.now(tz) + timedelta(hours=1), "existing timer")
 
-        mock_client = AsyncMock()
-        mock_client.models.generate_content.return_value = _make_response(
-            _text_part("Good morning!")
-        )
-        agent._client = mock_client
+        mock_litellm.acompletion = AsyncMock(return_value=_make_response(
+            content="Good morning!"
+        ))
 
         trigger = {
             "kind": "TIMER",
@@ -84,7 +86,7 @@ class TestTurnExecution:
         await agent._run_turn(trigger)
 
         # Should have made exactly 1 API call
-        assert mock_client.models.generate_content.await_count == 1
+        assert mock_litellm.acompletion.await_count == 1
         # Conversation should have 2 new messages: user trigger + assistant response
         assert len(agent._conversation) == 2
         assert agent._conversation[0]["role"] == "user"
@@ -92,23 +94,22 @@ class TestTurnExecution:
 
     @patch("agent.build_system_prompt", return_value="system prompt")
     @patch("agent.execute_tool", new_callable=AsyncMock)
-    async def test_turn_with_tool_call(self, mock_exec, _prompt, agent_setup, tz):
+    @patch("agent.litellm")
+    async def test_turn_with_tool_call(self, mock_litellm, mock_exec, _prompt, agent_setup, tz):
         agent, config, timer, queue = agent_setup
         timer.schedule(datetime.now(tz) + timedelta(hours=1), "existing timer")
 
         mock_exec.return_value = {"status": "sent"}
 
-        # First API call returns function_call, second returns text
-        mock_client = AsyncMock()
-        mock_client.models.generate_content.side_effect = [
+        # First API call returns tool_call, second returns text
+        mock_litellm.acompletion = AsyncMock(side_effect=[
             _make_response(
-                _function_call_part("send_message", {"text": "hi"})
+                tool_calls=[_tool_call("send_message", {"text": "hi"})]
             ),
             _make_response(
-                _text_part("Done!")
+                content="Done!"
             ),
-        ]
-        agent._client = mock_client
+        ])
 
         trigger = {
             "kind": "USER",
@@ -117,20 +118,18 @@ class TestTurnExecution:
         }
         await agent._run_turn(trigger)
 
-        assert mock_client.models.generate_content.await_count == 2
+        assert mock_litellm.acompletion.await_count == 2
         mock_exec.assert_awaited_once_with("send_message", {"text": "hi"})
 
     @patch("agent.build_system_prompt", return_value="system prompt")
-    async def test_nudge_when_no_timer(self, _prompt, agent_setup, tz):
+    @patch("agent.litellm")
+    async def test_nudge_when_no_timer(self, mock_litellm, _prompt, agent_setup, tz):
         agent, config, timer, queue = agent_setup
         # No timer set — agent should nudge
 
-        mock_client = AsyncMock()
-        # 4 calls: 3 nudges that return text without setting timer, then 4th also text
-        mock_client.models.generate_content.return_value = _make_response(
-            _text_part("I'll check in later")
-        )
-        agent._client = mock_client
+        mock_litellm.acompletion = AsyncMock(return_value=_make_response(
+            content="I'll check in later"
+        ))
 
         trigger = {
             "kind": "TIMER",
@@ -140,22 +139,21 @@ class TestTurnExecution:
         await agent._run_turn(trigger)
 
         # 1 initial + 3 nudges = 4 API calls
-        assert mock_client.models.generate_content.await_count == 4
+        assert mock_litellm.acompletion.await_count == 4
         # After 3 nudges, timer should have been force-set
         assert timer.is_active()
         assert "auto-scheduled" in timer.reason
 
     @patch("agent.build_system_prompt", return_value="system prompt")
-    async def test_reflection_trigger_skips_nudge(self, _prompt, agent_setup, tz):
+    @patch("agent.litellm")
+    async def test_reflection_trigger_skips_nudge(self, mock_litellm, _prompt, agent_setup, tz):
         """REFLECTION triggers should NOT nudge about missing timers."""
         agent, config, timer, queue = agent_setup
         # No timer set — but REFLECTION should skip nudging
 
-        mock_client = AsyncMock()
-        mock_client.models.generate_content.return_value = _make_response(
-            _text_part("Nothing to do right now.")
-        )
-        agent._client = mock_client
+        mock_litellm.acompletion = AsyncMock(return_value=_make_response(
+            content="Nothing to do right now."
+        ))
 
         trigger = {
             "kind": "REFLECTION",
@@ -165,7 +163,7 @@ class TestTurnExecution:
         await agent._run_turn(trigger)
 
         # Only 1 API call — no nudges
-        assert mock_client.models.generate_content.await_count == 1
+        assert mock_litellm.acompletion.await_count == 1
         # Timer should NOT have been force-set
         assert not timer.is_active()
 
@@ -210,17 +208,20 @@ class TestReflectionInterval:
 
 class TestSerialization:
 
-    def test_serialization_roundtrip(self):
-        parts = [
-            _text_part("hello"),
-            _function_call_part("send_message", {"text": "hi"}),
-        ]
-        response = _make_response(*parts)
+    def test_text_response(self):
+        response = _make_response(content="hello")
         serialized = _serialize_response(response)
-        assert serialized == [
-            {"type": "text", "text": "hello"},
-            {"type": "function_call", "name": "send_message", "args": {"text": "hi"}},
-        ]
+        assert serialized == {"role": "assistant", "content": "hello"}
+
+    def test_tool_call_response(self):
+        response = _make_response(
+            tool_calls=[_tool_call("send_message", {"text": "hi"}, call_id="call_abc")]
+        )
+        serialized = _serialize_response(response)
+        assert serialized["role"] == "assistant"
+        assert isinstance(serialized["content"], dict)
+        assert serialized["content"]["tool_calls"][0]["id"] == "call_abc"
+        assert serialized["content"]["tool_calls"][0]["function"]["name"] == "send_message"
 
 
 class TestHistoryPersistence:
@@ -229,7 +230,7 @@ class TestHistoryPersistence:
         agent, config, timer, queue = agent_setup
         agent._conversation = [
             {"role": "user", "content": [{"type": "text", "text": "hello"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": "hi"},
         ]
         agent.save_history()
 
@@ -241,5 +242,15 @@ class TestHistoryPersistence:
     async def test_load_no_history_file(self, agent_setup):
         agent, config, timer, queue = agent_setup
         # No history file exists
+        agent.load_history()
+        assert agent._conversation == []
+
+    async def test_load_old_format_clears_history(self, agent_setup):
+        """Old history without version marker should be cleared."""
+        agent, config, timer, queue = agent_setup
+        # Write old-format history (no version)
+        config.history_file.write_text(json.dumps({
+            "messages": [{"role": "user", "content": "old"}]
+        }))
         agent.load_history()
         assert agent._conversation == []

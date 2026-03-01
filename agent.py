@@ -7,14 +7,16 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from google import genai
-from google.genai import types
+import litellm
 
 from config import Config
 from logger import AgentLogger
 from prompts import build_system_prompt
 from timer import WakeupTimer
 from tools import TOOL_DECLARATIONS, execute_tool
+
+# History format version — bump when conversation format changes
+_HISTORY_VERSION = 2
 
 
 class Agent:
@@ -32,22 +34,22 @@ class Agent:
         self._logger = logger
         self._plugin_registry = plugin_registry
         self._tz = ZoneInfo(config.timezone)
-        self._client = genai.Client(
-            vertexai=True,
-            project=config.gcp_project_id,
-            location=config.gcp_region,
-        ).aio
         self._conversation: list[dict] = []
         self._last_activity_time: float = time.monotonic()
 
     def load_history(self):
         if self._config.history_file.exists():
             data = json.loads(self._config.history_file.read_text())
+            # Check format version — clear incompatible old history
+            if data.get("version") != _HISTORY_VERSION:
+                logging.info("History format version mismatch — starting fresh")
+                self._conversation = []
+                return
             self._conversation = data.get("messages", [])
 
     def save_history(self):
         self._config.history_file.write_text(
-            json.dumps({"messages": self._conversation}, indent=2, default=str)
+            json.dumps({"version": _HISTORY_VERSION, "messages": self._conversation}, indent=2, default=str)
         )
 
     async def run(self):
@@ -141,8 +143,7 @@ class Agent:
             call_num += 1
             system = build_system_prompt(self._config.data_dir, self._tz, self._plugin_registry)
 
-            # Build contents list as GenAI Content objects
-            contents = _build_contents(self._conversation)
+            messages = _build_messages(self._conversation, system)
 
             t0 = time.monotonic()
             max_retries = 5
@@ -150,15 +151,11 @@ class Agent:
             for attempt in range(1, max_retries + 1):
                 try:
                     response = await asyncio.wait_for(
-                        self._client.models.generate_content(
+                        litellm.acompletion(
                             model=self._config.model,
-                            contents=contents,
-                            config=types.GenerateContentConfig(
-                                system_instruction=system,
-                                max_output_tokens=self._config.max_tokens,
-                                tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
-                                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                            ),
+                            messages=messages,
+                            tools=TOOL_DECLARATIONS,
+                            max_tokens=self._config.max_tokens,
                         ),
                         timeout=60,
                     )
@@ -166,29 +163,26 @@ class Agent:
                 except (asyncio.TimeoutError, Exception) as exc:
                     if attempt < max_retries:
                         delay = 10 * (2 ** (attempt - 1))  # 10s, 20s, 40s, 80s
-                        logging.warning("Gemini API attempt %d/%d failed (%s), retrying in %ds", attempt, max_retries, exc, delay)
+                        logging.warning("LiteLLM API attempt %d/%d failed (%s), retrying in %ds", attempt, max_retries, exc, delay)
                         await asyncio.sleep(delay)
                     else:
-                        logging.error("Gemini API failed after %d attempts: %s", max_retries, exc)
+                        logging.error("LiteLLM API failed after %d attempts: %s", max_retries, exc)
             if response is None:
                 break
             latency_ms = int((time.monotonic() - t0) * 1000)
 
-            # Serialize the response content to plain dicts for storage
-            assistant_content = _serialize_response(response)
-            self._conversation.append({"role": "assistant", "content": assistant_content})
+            # Serialize the response to plain dicts for storage
+            assistant_msg = _serialize_response(response)
+            self._conversation.append(assistant_msg)
 
             # Extract function calls
-            function_calls = [
-                part for part in (response.candidates[0].content.parts or [])
-                if part.function_call
-            ]
+            tool_calls = response.choices[0].message.tool_calls or []
 
             # Log
-            tc_log = [{"name": fc.function_call.name, "args": dict(fc.function_call.args or {})} for fc in function_calls]
+            tc_log = [{"name": tc.function.name, "args": json.loads(tc.function.arguments)} for tc in tool_calls]
             self._logger.log_api_call(call_num, trigger_info, response, tc_log, latency_ms)
 
-            if not function_calls:
+            if not tool_calls:
                 # No tools — check if timer is active (skip nudge for REFLECTION triggers)
                 if not is_reflection:
                     if not self._timer.is_active() and nudge_count < max_nudges:
@@ -205,24 +199,19 @@ class Agent:
                 break
 
             # Execute tools and collect results
-            tool_results = []
-            for fc_part in function_calls:
-                fc = fc_part.function_call
-                args = dict(fc.args or {})
-                self._logger.log_tool_call(fc.name, _args_summary(args))
-                result = await execute_tool(fc.name, args)
-                # Guard against non-dict results (e.g. plugins returning strings)
+            for tc in tool_calls:
+                args = json.loads(tc.function.arguments)
+                self._logger.log_tool_call(tc.function.name, _args_summary(args))
+                result = await execute_tool(tc.function.name, args)
+                # Guard against non-dict results
                 if not isinstance(result, dict):
                     result = {"result": result}
                 is_error = result.pop("is_error", False)
-                tool_results.append({
-                    "type": "function_response",
-                    "name": fc.name,
-                    "response": result,
-                    "is_error": is_error,
+                self._conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result),
                 })
-
-            self._conversation.append({"role": "tool", "content": tool_results})
 
         # Auto-compact if needed
         token_estimate = _estimate_tokens(self._conversation)
@@ -250,25 +239,23 @@ class Agent:
         text_parts = []
         for msg in old:
             role = msg["role"]
-            content = msg["content"]
+            content = msg.get("content", "")
             if isinstance(content, str):
                 text_parts.append(f"{role}: {content}")
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text_parts.append(f"{role}: {block['text']}")
-                    elif isinstance(block, dict) and block.get("type") == "function_response":
-                        text_parts.append(f"{role} (tool_result): {json.dumps(block.get('response', ''))}")
 
-        summary_response = await self._client.models.generate_content(
+        summary_response = await litellm.acompletion(
             model=self._config.model,
-            contents=[types.Content(role="user", parts=[types.Part.from_text(text="\n".join(text_parts))])],
-            config=types.GenerateContentConfig(
-                system_instruction="Summarize this conversation into key facts, decisions, and current state. Be concise.",
-                max_output_tokens=2000,
-            ),
+            messages=[
+                {"role": "system", "content": "Summarize this conversation into key facts, decisions, and current state. Be concise."},
+                {"role": "user", "content": "\n".join(text_parts)},
+            ],
+            max_tokens=2000,
         )
-        summary = summary_response.text
+        summary = summary_response.choices[0].message.content
 
         self._conversation.clear()
         self._conversation.append({
@@ -277,90 +264,118 @@ class Agent:
         })
         self._conversation.append({
             "role": "assistant",
-            "content": [{"type": "text", "text": "Understood. I have the context from the summary and will continue from here."}],
+            "content": "Understood. I have the context from the summary and will continue from here.",
         })
         self._conversation.extend(recent)
         self.save_history()
 
 
-def _build_contents(conversation: list[dict]) -> list[types.Content]:
-    """Convert stored conversation dicts to GenAI Content objects."""
-    contents = []
+def _build_messages(conversation: list[dict], system_prompt: str) -> list[dict]:
+    """Convert stored conversation dicts to OpenAI message format."""
+    messages = [{"role": "system", "content": system_prompt}]
+
     for msg in conversation:
         role = msg["role"]
-        raw_content = msg["content"]
+        raw_content = msg.get("content", "")
 
         if role == "user":
             parts = []
             if isinstance(raw_content, str):
-                parts.append(types.Part.from_text(text=raw_content))
+                parts.append({"type": "text", "text": raw_content})
             elif isinstance(raw_content, list):
                 for block in raw_content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(types.Part.from_text(text=block["text"]))
+                        parts.append({"type": "text", "text": block["text"]})
                     elif isinstance(block, dict) and block.get("type") == "image":
                         source = block.get("source", {})
-                        parts.append(types.Part.from_bytes(
-                            data=base64.b64decode(source["data"]),
-                            mime_type=source.get("media_type", "image/jpeg"),
-                        ))
+                        mime = source.get("media_type", "image/jpeg")
+                        data = source["data"]
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{data}"},
+                        })
             if parts:
-                contents.append(types.Content(role="user", parts=parts))
+                messages.append({"role": "user", "content": parts})
 
-        elif role == "assistant" or role == "model":
-            parts = []
+        elif role in ("assistant", "model"):
+            # Could be a string, a list of content blocks, or a dict with tool_calls
             if isinstance(raw_content, str):
-                parts.append(types.Part.from_text(text=raw_content))
+                messages.append({"role": "assistant", "content": raw_content})
+            elif isinstance(raw_content, dict):
+                # Stored as {"content": ..., "tool_calls": [...]}
+                m = {"role": "assistant", "content": raw_content.get("content")}
+                if raw_content.get("tool_calls"):
+                    m["tool_calls"] = raw_content["tool_calls"]
+                messages.append(m)
             elif isinstance(raw_content, list):
+                # Legacy format: list of content blocks (text + function_call)
+                text_parts = []
+                tool_calls = []
                 for block in raw_content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(types.Part.from_text(text=block["text"]))
+                        text_parts.append(block["text"])
                     elif isinstance(block, dict) and block.get("type") == "function_call":
-                        fc_part = types.Part(
-                            function_call=types.FunctionCall(
-                                name=block["name"],
-                                args=block.get("args", {}),
-                            ),
-                        )
-                        # Restore thought_signature required by Gemini 3.1
-                        if block.get("thought_signature"):
-                            fc_part.thought_signature = base64.b64decode(block["thought_signature"])
-                        parts.append(fc_part)
-            if parts:
-                contents.append(types.Content(role="model", parts=parts))
+                        tool_calls.append({
+                            "id": block.get("id", f"call_{block['name']}"),
+                            "type": "function",
+                            "function": {
+                                "name": block["name"],
+                                "arguments": json.dumps(block.get("args", {})),
+                            },
+                        })
+                m = {"role": "assistant", "content": " ".join(text_parts) if text_parts else None}
+                if tool_calls:
+                    m["tool_calls"] = tool_calls
+                messages.append(m)
 
         elif role == "tool":
-            parts = []
-            if isinstance(raw_content, list):
+            # New format: each tool result is its own message
+            if isinstance(raw_content, str):
+                # Already in new format (content is json string)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", "unknown"),
+                    "content": raw_content,
+                })
+            elif isinstance(raw_content, list):
+                # Legacy format: list of function_response blocks
                 for block in raw_content:
                     if isinstance(block, dict) and block.get("type") == "function_response":
-                        parts.append(types.Part.from_function_response(
-                            name=block["name"],
-                            response=block.get("response", {}),
-                        ))
-            if parts:
-                contents.append(types.Content(role="user", parts=parts))
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_call_id", f"call_{block['name']}"),
+                            "content": json.dumps(block.get("response", {})),
+                        })
 
-    return contents
+    return messages
 
 
-def _serialize_response(response) -> list[dict]:
-    """Convert GenAI response parts to plain dicts for storage."""
-    result = []
-    parts = response.candidates[0].content.parts or []
-    for part in parts:
-        if part.function_call:
-            d = {
-                "type": "function_call",
-                "name": part.function_call.name,
-                "args": dict(part.function_call.args or {}),
-            }
-            # Gemini 3.1 requires thought_signature to be echoed back
-            if getattr(part, "thought_signature", None):
-                d["thought_signature"] = base64.b64encode(part.thought_signature).decode()
-            result.append(d)
-        elif part.text:
-            result.append({"type": "text", "text": part.text})
+def _serialize_response(response) -> dict:
+    """Convert LiteLLM response to plain dict for conversation storage."""
+    message = response.choices[0].message
+    result = {"role": "assistant"}
+
+    content = message.content
+    tool_calls = message.tool_calls
+
+    if tool_calls:
+        result["content"] = {
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        }
+    else:
+        result["content"] = content or ""
+
     return result
 
 
@@ -395,4 +410,6 @@ def _estimate_tokens(conversation: list[dict]) -> int:
             for block in content:
                 if isinstance(block, dict):
                     total_chars += len(json.dumps(block))
+        elif isinstance(content, dict):
+            total_chars += len(json.dumps(content))
     return total_chars // 4

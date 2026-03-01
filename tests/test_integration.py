@@ -1,11 +1,11 @@
-"""Live integration tests — hit real Gemini API and Telegram.
+"""Live integration tests — hit real LLM API and Telegram.
 
 Skipped automatically when credentials are not available:
-- All tests skip if GCP_PROJECT_ID is unset or google.auth.default() fails
+- LLM tests skip if ADC credentials are not configured
 - Telegram test skips independently if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are unset
 """
 
-import base64
+import json
 import os
 
 import pytest
@@ -14,10 +14,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Module-level skip: no GCP project or no ADC credentials → skip everything
+# Module-level skip: no ADC credentials → skip LLM tests
 # ---------------------------------------------------------------------------
-_gcp_project = os.environ.get("GCP_PROJECT_ID", "")
-
 _has_adc = False
 try:
     import google.auth
@@ -28,8 +26,8 @@ except Exception:
     pass
 
 pytestmark = pytest.mark.skipif(
-    not _gcp_project or not _has_adc,
-    reason="Live integration tests require GCP_PROJECT_ID and ADC credentials",
+    not _has_adc,
+    reason="Live integration tests require ADC credentials (gcloud auth application-default login)",
 )
 
 # ---------------------------------------------------------------------------
@@ -43,128 +41,110 @@ skip_no_telegram = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 # Imports used by the tests (after skip guard so missing deps don't explode)
 # ---------------------------------------------------------------------------
-from google import genai
-from google.genai import types
+import litellm
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def gemini_client():
-    project = os.environ["GCP_PROJECT_ID"]
-    location = os.environ.get("GCP_REGION", "global")
-    return genai.Client(vertexai=True, project=project, location=location).aio
-
-
-@pytest.fixture
 def model_name():
-    return os.environ.get("MODEL", "gemini-3.1-pro-preview")
+    return os.environ.get("MODEL", "vertex_ai_beta/gemini-3.1-pro-preview")
 
 
 # ---------------------------------------------------------------------------
 # Minimal tool definition for the tool-call round-trip test
 # ---------------------------------------------------------------------------
-_TEST_TOOL = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration(
-            name="get_current_time",
-            description="Returns the current UTC time.",
-            parameters=types.Schema(type="OBJECT", properties={}),
-        )
-    ]
-)
+_TEST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_current_time",
+        "description": "Returns the current UTC time.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+}
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-class TestGeminiIntegration:
+class TestLLMIntegration:
 
-    async def test_gemini_basic_call(self, gemini_client, model_name):
-        """Simple generate_content — no tools, just verify we get text back."""
-        response = await gemini_client.models.generate_content(
+    async def test_basic_call(self, model_name):
+        """Simple completion — no tools, just verify we get a response."""
+        response = await litellm.acompletion(
             model=model_name,
-            contents=[types.Content(role="user", parts=[types.Part.from_text(text="Say hello.")])],
-            config=types.GenerateContentConfig(max_output_tokens=64),
+            messages=[
+                {"role": "user", "content": "Say hello."},
+            ],
+            max_tokens=256,
         )
-        assert response.text, "Expected non-empty text from Gemini"
+        assert response.choices[0].message is not None, "Expected a message from LLM"
 
-    async def test_gemini_tool_call_roundtrip(self, gemini_client, model_name):
-        """Full tool-call round-trip including thought_signature preservation.
-
-        Mirrors the pattern in agent.py:258-268 (_build_contents) and
-        agent.py:286-303 (_serialize_response).
-        """
+    async def test_tool_call_roundtrip(self, model_name):
+        """Full tool-call round-trip: prompt → tool_call → tool result → text."""
         # --- Turn 1: prompt that forces a tool call ---
-        response = await gemini_client.models.generate_content(
+        response = await litellm.acompletion(
             model=model_name,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text="What time is it right now?")],
-                ),
+            messages=[
+                {"role": "system", "content": "Always use the get_current_time tool to answer time questions. Never guess."},
+                {"role": "user", "content": "What time is it right now?"},
             ],
-            config=types.GenerateContentConfig(
-                system_instruction="Always use the get_current_time tool to answer time questions. Never guess.",
-                max_output_tokens=256,
-                tools=[_TEST_TOOL],
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            ),
+            tools=[_TEST_TOOL],
+            max_tokens=256,
         )
 
-        # Find the function_call part
-        fc_parts = [p for p in (response.candidates[0].content.parts or []) if p.function_call]
-        assert fc_parts, "Expected Gemini to return a function_call part"
+        tool_calls = response.choices[0].message.tool_calls
+        assert tool_calls, "Expected LLM to return a tool call"
+        assert tool_calls[0].function.name == "get_current_time"
 
-        fc_part = fc_parts[0]
-        assert fc_part.function_call.name == "get_current_time"
-
-        # Capture thought_signature (may or may not be present depending on model)
-        thought_sig = getattr(fc_part, "thought_signature", None)
-
-        # --- Rebuild model turn with thought_signature preserved ---
-        model_fc_part = types.Part(
-            function_call=types.FunctionCall(
-                name=fc_part.function_call.name,
-                args=dict(fc_part.function_call.args or {}),
-            ),
-        )
-        if thought_sig:
-            model_fc_part.thought_signature = thought_sig
-
-        model_turn = types.Content(role="model", parts=[model_fc_part])
-
-        # --- Turn 2: send function_response back ---
-        tool_turn = types.Content(
-            role="user",
-            parts=[
-                types.Part.from_function_response(
-                    name="get_current_time",
-                    response={"time": "2026-02-22T12:00:00Z"},
-                ),
-            ],
-        )
-
-        response2 = await gemini_client.models.generate_content(
+        # --- Turn 2: send tool result back ---
+        response2 = await litellm.acompletion(
             model=model_name,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text="What time is it right now?")],
-                ),
-                model_turn,
-                tool_turn,
+            messages=[
+                {"role": "system", "content": "Always use the get_current_time tool to answer time questions. Never guess."},
+                {"role": "user", "content": "What time is it right now?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tool_calls[0].id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_calls[0].function.name,
+                                "arguments": tool_calls[0].function.arguments,
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_calls[0].id,
+                    "content": json.dumps({"time": "2026-03-01T12:00:00Z"}),
+                },
             ],
-            config=types.GenerateContentConfig(
-                system_instruction="Always use the get_current_time tool to answer time questions. Never guess.",
-                max_output_tokens=256,
-                tools=[_TEST_TOOL],
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            ),
+            tools=[_TEST_TOOL],
+            max_tokens=256,
         )
 
-        assert response2.text, "Expected text response after function_response round-trip"
+        text = response2.choices[0].message.content
+        assert text, "Expected text response after tool result round-trip"
+
+    async def test_usage_metadata(self, model_name):
+        """Verify usage tokens are populated in the response."""
+        response = await litellm.acompletion(
+            model=model_name,
+            messages=[
+                {"role": "user", "content": "Say one word."},
+            ],
+            max_tokens=16,
+        )
+        assert response.usage.prompt_tokens > 0, "Expected prompt_tokens > 0"
+        assert response.usage.completion_tokens > 0, "Expected completion_tokens > 0"
 
 
 @skip_no_telegram

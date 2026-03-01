@@ -6,171 +6,196 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from google.genai import types
-
 from search import web_search
 
-# --- Tool declarations (Google GenAI format) ---
+# --- Tool declarations (OpenAI function-calling format) ---
 
 TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="send_message",
-        description="Send a message to the user via Telegram. Use this to deliver plans, reminders, answers, and nudges. Supports text, images, or both (image with text caption). At least one of text or image_url must be provided. Do NOT use this to talk to yourself — only for messages the user should see.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Message text. Supports Telegram markdown. Required if no image_url. E.g. 'Time to leave for ASML — 25 min bike ride.'"
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message to the user via Telegram. Use this to deliver plans, reminders, answers, and nudges. Supports text, images, or both (image with text caption). At least one of text or image_url must be provided. Do NOT use this to talk to yourself — only for messages the user should see.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Message text. Supports Telegram markdown. Required if no image_url. E.g. 'Time to leave for ASML — 25 min bike ride.'"
+                    },
+                    "image_url": {
+                        "type": "string",
+                        "description": "URL of an image to send. If text is also provided, it becomes the caption. Required if no text."
+                    }
                 },
-                "image_url": {
-                    "type": "string",
-                    "description": "URL of an image to send. If text is also provided, it becomes the caption. Required if no text."
-                }
+                "required": []
             },
-            "required": []
         },
-    ),
-    types.FunctionDeclaration(
-        name="read_file",
-        description="Read a file from the data directory. Use to check any file you've created — memory, plans, profile info, etc. Check the 'Available files' listing in your system prompt to see what exists. Do NOT guess paths — only read files from the listing.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path from the data directory, as shown in 'Available files'. E.g. 'memory.md', 'groceries.md', 'training.md'."
-                }
-            },
-            "required": ["path"]
-        },
-    ),
-    types.FunctionDeclaration(
-        name="write_file",
-        description="Write or overwrite a file in the data directory. You decide what files to create and how to organize them. Replaces the entire file — use read_file first to preserve content, or edit_file for small changes. Also creates new files and parent directories.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path from the data directory. E.g. 'plan.md', 'profile/wardrobe.md'."
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file from the data directory. Use to check any file you've created — memory, plans, profile info, etc. Check the 'Available files' listing in your system prompt to see what exists. Do NOT guess paths — only read files from the listing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from the data directory, as shown in 'Available files'. E.g. 'memory.md', 'groceries.md', 'training.md'."
+                    }
                 },
-                "content": {
-                    "type": "string",
-                    "description": "The complete file content. This replaces the entire file."
-                }
+                "required": ["path"]
             },
-            "required": ["path", "content"]
         },
-    ),
-    types.FunctionDeclaration(
-        name="edit_file",
-        description="Apply a targeted text replacement in a file. Use this for small changes to large files — e.g. updating one time block in the plan, or adding a line to memory. Do NOT use if you need to restructure the whole file — use write_file for that. old_text must match exactly including whitespace.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path from the data directory. File must exist."
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write or overwrite a file in the data directory. You decide what files to create and how to organize them. Replaces the entire file — use read_file first to preserve content, or edit_file for small changes. Also creates new files and parent directories.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from the data directory. E.g. 'plan.md', 'profile/wardrobe.md'."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The complete file content. This replaces the entire file."
+                    }
                 },
-                "old_text": {
-                    "type": "string",
-                    "description": "Exact text to find in the file. Must be unique. Copy exactly as it appears."
+                "required": ["path", "content"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Apply a targeted text replacement in a file. Use this for small changes to large files — e.g. updating one time block in the plan, or adding a line to memory. Do NOT use if you need to restructure the whole file — use write_file for that. old_text must match exactly including whitespace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from the data directory. File must exist."
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to find in the file. Must be unique. Copy exactly as it appears."
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text. Can be longer, shorter, or empty (to delete)."
+                    }
                 },
-                "new_text": {
-                    "type": "string",
-                    "description": "Replacement text. Can be longer, shorter, or empty (to delete)."
-                }
+                "required": ["path", "old_text", "new_text"]
             },
-            "required": ["path", "old_text", "new_text"]
         },
-    ),
-    types.FunctionDeclaration(
-        name="set_next_wakeup",
-        description="Schedule when to wake up next without a user message. Use for proactive check-ins, reminders, and timed nudges. A timer should always be active so you don't lose track of the user. Only one timer active at a time — calling this replaces any existing timer. Timer persists when user messages arrive; only replaced by calling this tool again.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "time": {
-                    "type": "string",
-                    "description": "When to wake up. ISO time for today ('14:30'), full datetime ('2026-02-22T07:00'), or relative ('+45m', '+2h')."
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_next_wakeup",
+            "description": "Schedule when to wake up next without a user message. Use for proactive check-ins, reminders, and timed nudges. A timer should always be active so you don't lose track of the user. Only one timer active at a time — calling this replaces any existing timer. Timer persists when user messages arrive; only replaced by calling this tool again.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time": {
+                        "type": "string",
+                        "description": "When to wake up. ISO time for today ('14:30'), full datetime ('2026-02-22T07:00'), or relative ('+45m', '+2h')."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why you are waking up, shown to you when timer fires. Be specific: 'Check if user has left for ASML', not 'check in'."
+                    }
                 },
-                "reason": {
-                    "type": "string",
-                    "description": "Why you are waking up, shown to you when timer fires. Be specific: 'Check if user has left for ASML', not 'check in'."
-                }
+                "required": ["time", "reason"]
             },
-            "required": ["time", "reason"]
         },
-    ),
-    types.FunctionDeclaration(
-        name="web_search",
-        description="Search the web for information not in your files. Use for recipes, store hours, prices, transit, events. Do NOT use for info already in profile files — read those instead. Be specific in queries for better results.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query. Be specific: 'quick chicken broccoli rice recipe 30 minutes' not 'dinner recipe'."
-                }
-            },
-            "required": ["query"]
-        },
-    ),
-    types.FunctionDeclaration(
-        name="call_integration",
-        description="Call a plugin action. Use this for all integrations (weather, and any plugins you've created). Check the 'Available Integrations' section in your system prompt to see loaded plugins and their actions.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Plugin name (e.g. 'weather', 'echo')."
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for information not in your files. Use for recipes, store hours, prices, transit, events. Do NOT use for info already in profile files — read those instead. Be specific in queries for better results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query. Be specific: 'quick chicken broccoli rice recipe 30 minutes' not 'dinner recipe'."
+                    }
                 },
-                "action": {
-                    "type": "string",
-                    "description": "Action to call on the plugin (e.g. 'get_forecast')."
+                "required": ["query"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_integration",
+            "description": "Call a plugin action. Use this for all integrations (weather, and any plugins you've created). Check the 'Available Integrations' section in your system prompt to see loaded plugins and their actions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Plugin name (e.g. 'weather', 'echo')."
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Action to call on the plugin (e.g. 'get_forecast')."
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Parameters to pass to the action. Each plugin documents its expected params."
+                    }
                 },
-                "params": {
-                    "type": "object",
-                    "description": "Parameters to pass to the action. Each plugin documents its expected params."
-                }
+                "required": ["name", "action"]
             },
-            "required": ["name", "action"]
         },
-    ),
-    types.FunctionDeclaration(
-        name="write_plugin",
-        description="Create or update a plugin at runtime. Write Python code that will be saved to plugins/<name>.py and hot-loaded. The plugin must expose: PLUGIN_NAME (str), ACTIONS (dict), and an async call(action, params) function. Optionally expose PLUGIN_DESCRIPTION (str) and async setup(config). After writing, all declared actions are auto-tested with empty params — the results tell you which work and which need fixing. You can call this again to overwrite and fix a broken plugin. Dangerous imports (subprocess, shutil, sys, ctypes, os) are blocked.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Plugin name (will be saved as plugins/<name>.py). Use snake_case."
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_plugin",
+            "description": "Create or update a plugin at runtime. Write Python code that will be saved to plugins/<name>.py and hot-loaded. The plugin must expose: PLUGIN_NAME (str), ACTIONS (dict), and an async call(action, params) function. Optionally expose PLUGIN_DESCRIPTION (str) and async setup(config). After writing, all declared actions are auto-tested with empty params — the results tell you which work and which need fixing. You can call this again to overwrite and fix a broken plugin. Dangerous imports (subprocess, shutil, sys, ctypes, os) are blocked.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Plugin name (will be saved as plugins/<name>.py). Use snake_case."
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Python source code for the plugin."
+                    }
                 },
-                "code": {
-                    "type": "string",
-                    "description": "Complete Python source code for the plugin."
-                }
+                "required": ["name", "code"]
             },
-            "required": ["name", "code"]
         },
-    ),
-    types.FunctionDeclaration(
-        name="install_package",
-        description="Install Python packages from PyPI. Use this when a plugin needs a library that isn't installed yet. Only accepts package names (not URLs or local paths). Supports version specifiers like 'openpyxl>=3.0'. Multiple packages can be space-separated.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "packages": {
-                    "type": "string",
-                    "description": "Space-separated package names to install. E.g. 'openpyxl' or 'fitparse garmin-fit-sdk' or 'google-api-python-client>=2.0'."
-                }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "install_package",
+            "description": "Install Python packages from PyPI. Use this when a plugin needs a library that isn't installed yet. Only accepts package names (not URLs or local paths). Supports version specifiers like 'openpyxl>=3.0'. Multiple packages can be space-separated.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "packages": {
+                        "type": "string",
+                        "description": "Space-separated package names to install. E.g. 'openpyxl' or 'fitparse garmin-fit-sdk' or 'google-api-python-client>=2.0'."
+                    }
+                },
+                "required": ["packages"]
             },
-            "required": ["packages"]
         },
-    ),
+    },
 ]
 
 
