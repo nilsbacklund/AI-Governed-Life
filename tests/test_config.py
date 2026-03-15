@@ -42,7 +42,7 @@ class TestLoadConfig:
         assert cfg.default_location == "Eindhoven"
         assert cfg.default_lat == 51.4416
         assert cfg.default_lon == 5.4697
-        assert cfg.model == "vertex_ai_beta/gemini-3.1-pro-preview"
+        assert cfg.model == "vertex_ai/zai-org/glm-5-maas"
         assert cfg.max_tokens == 4096
         assert cfg.token_threshold == 80000
 

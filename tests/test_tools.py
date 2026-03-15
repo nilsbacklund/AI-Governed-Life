@@ -332,6 +332,26 @@ async def call(action, params):
             plugins.PLUGINS_DIR = original_dir
 
 
+class TestSetReaction:
+
+    async def test_set_reaction_success(self, setup_tools):
+        send_fn, config, timer = setup_tools
+        react_fn = AsyncMock()
+        init_tools(send_fn, config, timer, react_fn=react_fn)
+        result = await execute_tool("set_reaction", {"message_id": 123, "emoji": "\ud83d\udc4d"})
+        assert result["status"] == "reacted"
+        assert result["message_id"] == 123
+        assert result["emoji"] == "\ud83d\udc4d"
+        react_fn.assert_awaited_once_with(123, "\ud83d\udc4d")
+
+    async def test_set_reaction_no_react_fn(self, setup_tools):
+        send_fn, config, timer = setup_tools
+        init_tools(send_fn, config, timer, react_fn=None)
+        result = await execute_tool("set_reaction", {"message_id": 123, "emoji": "\ud83d\udc4d"})
+        assert result.get("is_error") is True
+        assert "not initialized" in result["error"]
+
+
 class TestCheckImports:
 
     def test_no_blocked_imports(self):

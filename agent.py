@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import logging
 import time
@@ -46,6 +45,28 @@ class Agent:
                 self._conversation = []
                 return
             self._conversation = data.get("messages", [])
+            self._sanitize_history()
+
+    def _sanitize_history(self):
+        """Remove orphaned tool messages that have no matching assistant tool_call."""
+        known_tool_call_ids = set()
+        clean = []
+        for msg in self._conversation:
+            role = msg.get("role")
+            if role == "assistant":
+                content = msg.get("content")
+                if isinstance(content, dict):
+                    for tc in content.get("tool_calls", []):
+                        known_tool_call_ids.add(tc["id"])
+            if role == "tool":
+                tc_id = msg.get("tool_call_id")
+                if tc_id not in known_tool_call_ids:
+                    logging.warning("Dropping orphaned tool message: %s", tc_id)
+                    continue
+            clean.append(msg)
+        if len(clean) != len(self._conversation):
+            self._conversation = clean
+            self.save_history()
 
     def save_history(self):
         self._config.history_file.write_text(
@@ -99,10 +120,7 @@ class Agent:
         if finished is reflection_task:
             now_str = datetime.now(self._tz).strftime('%H:%M')
             trigger_text = (
-                f"[SELF-REFLECTION] Wakeup at {now_str}. "
-                "What can you do to improve right now? Consider: writing plugins for "
-                "missing capabilities, updating your files, preparing for upcoming events, "
-                "or checking on pending tasks."
+                f"[SELF-REFLECTION] Wakeup at {now_str}. What can you do to improve right now? Consider: writing plugins for missing capabilities, updating your files, preparing for upcoming events, or checking on pending tasks. If you have nothing to do or improve right now, come up with a plan and create something to impress the user."
             )
             trigger = {
                 "kind": "REFLECTION",
@@ -169,6 +187,9 @@ class Agent:
                         logging.error("LiteLLM API failed after %d attempts: %s", max_retries, exc)
             if response is None:
                 break
+            if not response.choices:
+                logging.warning("LiteLLM returned empty choices — skipping turn")
+                break
             latency_ms = int((time.monotonic() - t0) * 1000)
 
             # Serialize the response to plain dicts for storage
@@ -209,7 +230,7 @@ class Agent:
                 is_error = result.pop("is_error", False)
                 self._conversation.append({
                     "role": "tool",
-                    "tool_call_id": tc.id,
+                    "tool_call_id": _clean_tool_call_id(tc.id),
                     "content": json.dumps(result),
                 })
 
@@ -232,8 +253,18 @@ class Agent:
         if len(self._conversation) <= keep_last_n:
             return
 
-        old = self._conversation[:-keep_last_n]
-        recent = self._conversation[-keep_last_n:]
+        split = len(self._conversation) - keep_last_n
+
+        # Move split backward to a user message boundary so we never
+        # orphan tool responses from their matching assistant tool_calls.
+        while split > 0 and self._conversation[split].get("role") != "user":
+            split -= 1
+
+        if split <= 0:
+            return  # nothing safe to summarize
+
+        old = self._conversation[:split]
+        recent = self._conversation[split:]
 
         # Format old messages as text for summarization
         text_parts = []
@@ -274,6 +305,19 @@ def _build_messages(conversation: list[dict], system_prompt: str) -> list[dict]:
     """Convert stored conversation dicts to OpenAI message format."""
     messages = [{"role": "system", "content": system_prompt}]
 
+    # Collect known tool_call_ids from assistant messages for orphan detection
+    known_tc_ids = set()
+    for msg in conversation:
+        if msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, dict):
+                for tc in content.get("tool_calls", []):
+                    known_tc_ids.add(tc["id"])
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "function_call":
+                        known_tc_ids.add(block.get("id", f"call_{block['name']}"))
+
     for msg in conversation:
         role = msg["role"]
         raw_content = msg.get("content", "")
@@ -287,12 +331,11 @@ def _build_messages(conversation: list[dict], system_prompt: str) -> list[dict]:
                     if isinstance(block, dict) and block.get("type") == "text":
                         parts.append({"type": "text", "text": block["text"]})
                     elif isinstance(block, dict) and block.get("type") == "image":
-                        source = block.get("source", {})
-                        mime = source.get("media_type", "image/jpeg")
-                        data = source["data"]
+                        # Legacy: images used to be base64-encoded inline.
+                        # Now saved to inbox/ as files, but handle old history gracefully.
                         parts.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime};base64,{data}"},
+                            "type": "text",
+                            "text": "[Image — saved to inbox/]",
                         })
             if parts:
                 messages.append({"role": "user", "content": parts})
@@ -329,25 +372,44 @@ def _build_messages(conversation: list[dict], system_prompt: str) -> list[dict]:
                 messages.append(m)
 
         elif role == "tool":
+            # Safety net: skip orphaned tool messages with no matching tool_call
+            tc_id = msg.get("tool_call_id", "unknown")
+            if tc_id not in known_tc_ids:
+                logging.warning("_build_messages: skipping orphaned tool message %s", tc_id)
+                continue
+
             # New format: each tool result is its own message
             if isinstance(raw_content, str):
                 # Already in new format (content is json string)
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": msg.get("tool_call_id", "unknown"),
+                    "tool_call_id": tc_id,
                     "content": raw_content,
                 })
             elif isinstance(raw_content, list):
                 # Legacy format: list of function_response blocks
                 for block in raw_content:
                     if isinstance(block, dict) and block.get("type") == "function_response":
+                        block_tc_id = block.get("tool_call_id", f"call_{block['name']}")
+                        if block_tc_id not in known_tc_ids:
+                            logging.warning("_build_messages: skipping orphaned tool block %s", block_tc_id)
+                            continue
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": block.get("tool_call_id", f"call_{block['name']}"),
+                            "tool_call_id": block_tc_id,
                             "content": json.dumps(block.get("response", {})),
                         })
 
     return messages
+
+
+def _clean_tool_call_id(tc_id: str | None) -> str:
+    """Strip Gemini thought signatures embedded in tool call IDs."""
+    if not tc_id:
+        return tc_id or ""
+    if "__thought__" in tc_id:
+        return tc_id.split("__thought__")[0]
+    return tc_id
 
 
 def _serialize_response(response) -> dict:
@@ -363,7 +425,7 @@ def _serialize_response(response) -> dict:
             "content": content,
             "tool_calls": [
                 {
-                    "id": tc.id,
+                    "id": _clean_tool_call_id(tc.id),
                     "type": "function",
                     "function": {
                         "name": tc.function.name,

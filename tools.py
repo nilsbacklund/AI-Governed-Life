@@ -36,7 +36,7 @@ TOOL_DECLARATIONS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the data directory. Use to check any file you've created — memory, plans, profile info, etc. Check the 'Available files' listing in your system prompt to see what exists. Do NOT guess paths — only read files from the listing.",
+            "description": "Read a file from the data directory. Use to check any file you've created — memory, plans, profile info, etc. Check the 'Available files' listing in your system prompt to see what exists. Do NOT guess paths — only read files from the listing. Files sent via Telegram are saved to inbox/. Text files (.csv, .txt, .md, .json) can be read directly. Binary files return metadata — use a plugin to parse them (install needed packages with install_package first).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -53,7 +53,7 @@ TOOL_DECLARATIONS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write or overwrite a file in the data directory. You decide what files to create and how to organize them. Replaces the entire file — use read_file first to preserve content, or edit_file for small changes. Also creates new files and parent directories.",
+            "description": "Write or overwrite a file in the data directory. You decide what files to create and how to organize them. Replaces the entire file — use read_file first to preserve content, or edit_file for small changes. Also creates new files and parent directories. Store API keys and credentials in secrets/ (e.g. secrets/api_key.txt). Never include secret values in messages — just confirm storage.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -162,7 +162,7 @@ TOOL_DECLARATIONS = [
         "type": "function",
         "function": {
             "name": "write_plugin",
-            "description": "Create or update a plugin at runtime. Write Python code that will be saved to plugins/<name>.py and hot-loaded. The plugin must expose: PLUGIN_NAME (str), ACTIONS (dict), and an async call(action, params) function. Optionally expose PLUGIN_DESCRIPTION (str) and async setup(config). After writing, all declared actions are auto-tested with empty params — the results tell you which work and which need fixing. You can call this again to overwrite and fix a broken plugin. Dangerous imports (subprocess, shutil, sys, ctypes, os) are blocked.",
+            "description": "Create or update a plugin at runtime. Write Python code that will be saved to plugins/<name>.py and hot-loaded. The plugin must expose: PLUGIN_NAME (str), ACTIONS (dict), and an async call(action, params) function returning a dict (not a string). Optionally expose PLUGIN_DESCRIPTION (str) and async setup(config). For HTTP requests, use httpx.AsyncClient (already installed) — never urllib.request. Study existing plugins with read_file as reference. After writing, all declared actions are auto-tested with empty params — the results tell you which work and which need fixing. When auto-tests report errors, fix the code and call write_plugin again — keep iterating until it works. Dangerous imports (subprocess, shutil, sys, ctypes, os) are blocked.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -196,6 +196,27 @@ TOOL_DECLARATIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reaction",
+            "description": "React to a Telegram message with an emoji. Use the msg:ID shown in messages to reference which message to react to. Common emojis: \ud83d\udc4d \ud83d\udc4e \u2764\ufe0f \ud83d\udd25 \ud83c\udf89 \ud83d\ude02 \ud83d\ude2e \ud83d\ude22 \ud83d\ude4f \ud83d\udc40",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "integer",
+                        "description": "The message ID to react to (from msg:ID prefix in messages)."
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": "The emoji to react with. E.g. '\ud83d\udc4d', '\u2764\ufe0f', '\ud83d\udd25'."
+                    }
+                },
+                "required": ["message_id", "emoji"]
+            },
+        },
+    },
 ]
 
 
@@ -205,14 +226,16 @@ _send_fn = None
 _config = None
 _timer = None
 _plugin_registry = None
+_react_fn = None
 
 
-def init_tools(send_fn, config, timer, plugin_registry=None):
-    global _send_fn, _config, _timer, _plugin_registry
+def init_tools(send_fn, config, timer, plugin_registry=None, react_fn=None):
+    global _send_fn, _config, _timer, _plugin_registry, _react_fn
     _send_fn = send_fn
     _config = config
     _timer = timer
     _plugin_registry = plugin_registry
+    _react_fn = react_fn
 
 
 # --- Blocked imports for write_plugin safety ---
@@ -271,8 +294,11 @@ async def execute_tool(name: str, args: dict) -> dict:
                 image_url = args.get("image_url")
                 if not text and not image_url:
                     return {"error": "At least one of text or image_url must be provided.", "is_error": True}
-                await _send_fn(text=text, image_url=image_url)
-                return {"status": "sent", "timestamp": datetime.now(ZoneInfo(_config.timezone)).isoformat()}
+                message_id = await _send_fn(text=text, image_url=image_url)
+                result = {"status": "sent", "timestamp": datetime.now(ZoneInfo(_config.timezone)).isoformat()}
+                if message_id is not None:
+                    result["message_id"] = message_id
+                return result
 
             case "read_file":
                 path = _sanitize_path(args["path"])
@@ -342,6 +368,12 @@ async def execute_tool(name: str, args: dict) -> dict:
 
             case "install_package":
                 return await _execute_install_package(args["packages"])
+
+            case "set_reaction":
+                if _react_fn is None:
+                    return {"error": "Reaction function not initialized.", "is_error": True}
+                await _react_fn(args["message_id"], args["emoji"])
+                return {"status": "reacted", "message_id": args["message_id"], "emoji": args["emoji"]}
 
             case _:
                 return {"error": f"Unknown tool: {name}", "is_error": True}

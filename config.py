@@ -40,7 +40,7 @@ def load_config() -> Config:
         default_location=os.getenv("DEFAULT_LOCATION", "Eindhoven"),
         default_lat=float(os.getenv("DEFAULT_LAT", "51.4416")),
         default_lon=float(os.getenv("DEFAULT_LON", "5.4697")),
-        model=os.getenv("MODEL", "vertex_ai_beta/gemini-3.1-pro-preview"),
+        model=os.getenv("MODEL", "vertex_ai/zai-org/glm-5-maas"),
         max_tokens=int(os.getenv("MAX_TOKENS", "4096")),
         token_threshold=int(os.getenv("TOKEN_THRESHOLD", "80000")),
         data_dir=base / "data",

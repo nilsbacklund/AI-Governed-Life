@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.constants import ParseMode
 
-from telegram_handler import make_send_fn, _save_file, _human_size
+from telegram_handler import make_send_fn, make_react_fn, _save_file, _human_size
 
 
 @pytest.fixture
@@ -18,13 +18,17 @@ def mock_app():
 class TestSendFn:
 
     async def test_send_text_with_markdown(self, mock_app):
+        mock_msg = MagicMock()
+        mock_msg.message_id = 42
+        mock_app.bot.send_message = AsyncMock(return_value=mock_msg)
         send = make_send_fn(mock_app, chat_id=123)
-        await send(text="*bold* message")
+        result = await send(text="*bold* message")
         mock_app.bot.send_message.assert_awaited_once_with(
             chat_id=123,
             text="*bold* message",
             parse_mode=ParseMode.MARKDOWN,
         )
+        assert result == 42
 
     async def test_send_text_markdown_fallback(self, mock_app):
         mock_app.bot.send_message = AsyncMock(
@@ -88,3 +92,11 @@ class TestFileReceiving:
         assert _human_size(1024) == "1.0 KB"
         assert _human_size(1024 * 1024) == "1.0 MB"
         assert _human_size(1536) == "1.5 KB"
+
+
+class TestReactFn:
+
+    async def test_react_calls_set_message_reaction(self, mock_app):
+        react = make_react_fn(mock_app, chat_id=123)
+        await react(message_id=456, emoji="\ud83d\udc4d")
+        mock_app.bot.set_message_reaction.assert_awaited_once()

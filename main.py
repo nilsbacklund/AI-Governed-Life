@@ -3,10 +3,11 @@ import signal
 import sys
 from zoneinfo import ZoneInfo
 
+from telegram import Update
 from config import load_config
 from timer import WakeupTimer
 from logger import AgentLogger
-from telegram_handler import setup_telegram, make_send_fn
+from telegram_handler import setup_telegram, make_send_fn, make_react_fn
 from tools import init_tools
 from plugins import PluginRegistry
 from agent import Agent
@@ -44,9 +45,10 @@ async def main():
     # Set up Telegram (manual lifecycle — don't use run_polling which calls asyncio.run)
     telegram_app = setup_telegram(config, queue)
     send_fn = make_send_fn(telegram_app, config.telegram_chat_id)
+    react_fn = make_react_fn(telegram_app, config.telegram_chat_id)
 
     # Inject dependencies into tools
-    init_tools(send_fn, config, timer, plugin_registry)
+    init_tools(send_fn, config, timer, plugin_registry, react_fn=react_fn)
 
     # Create agent
     agent = Agent(config, timer, queue, logger, plugin_registry)
@@ -65,7 +67,7 @@ async def main():
     # Start Telegram with manual lifecycle
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling()
+    await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
     print(f"AIBoss running (model={config.model}, tz={config.timezone})")
     print(f"Plugins loaded: {plugin_registry.plugin_names}")
